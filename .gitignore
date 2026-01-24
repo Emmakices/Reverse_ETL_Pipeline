@@ -1,0 +1,19 @@
+# Secrets / env
+config.env
+.env
+*.env
+
+# State / local outputs
+state/
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
