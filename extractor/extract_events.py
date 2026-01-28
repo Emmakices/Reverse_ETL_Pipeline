@@ -2,19 +2,28 @@
 """
 Event Extraction Pipeline (Single-File Version)
 
-Airflow-friendly checkpoint/resume:
-- Each run processes ONE week only.
+(Updated) Adds Airflow-friendly checkpoint/resume:
+- Each run still processes ONE week only.
 - If you run with --use-checkpoint, it picks the next week from state/extractor_state.json
 - After a successful run, it writes the next week to the state file.
 
-NEW (Reject handling + run status):
-- Writes VALID events to events.parquet
-- Writes REJECTED rows to rejects.parquet (with error metadata)
-- Run status:
-    - SUCCESS (0 rejects)
-    - SUCCESS_WITH_REJECTS (rejects exist but within threshold)
-    - FAILED (hard failure OR reject rate above threshold when strict validation is on)
-- Checkpoint advances only when run status is SUCCESS or SUCCESS_WITH_REJECTS (within threshold)
+(NEW) Adds Rejects output:
+- Any rows that fail Pydantic schema validation are saved as "rejects.parquet"
+- Rejects are saved locally AND (if configured) uploaded to ADLS
+- Valid rows still go to events.parquet (same as before)
+
+(NEW) Adds reject threshold + run status + checkpoint gating:
+- REJECT_THRESHOLD_PCT (default 5.0) controls max allowed rejected % per run.
+- run_status is one of: SUCCESS, SUCCESS_WITH_REJECTS, FAILED
+- If reject_rate_pct > threshold, the run is marked FAILED (checkpoint will NOT advance).
+- If rejects exist but are <= threshold, run_status=SUCCESS_WITH_REJECTS (checkpoint CAN advance).
+
+(NEW) Adds Azure SQL tracking:
+- Tracks pipeline runs in dbo.pipeline_run
+- Tracks pipeline stages in dbo.pipeline_stage
+- Reads/writes checkpoint from dbo.pipeline_checkpoint (with JSON fallback)
+- Uses AAD token authentication for Azure SQL
+- Enhanced stage error tracking for all phases (EXTRACT, TRANSFORM, LOAD, QUALITY_GATE)
 """
 
 from __future__ import annotations
@@ -29,11 +38,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import pandas as pd
+import pyodbc
 import requests
 from azure.core.exceptions import AzureError, ClientAuthenticationError, ServiceRequestError
 from azure.identity import DefaultAzureCredential
@@ -96,7 +107,7 @@ class ValidationError(ExtractorError):
 
 
 class SchemaValidationError(ValidationError):
-    """Raised when data doesn't match expected schema or reject rate too high."""
+    """Raised when data doesn't match expected schema."""
     pass
 
 
@@ -266,18 +277,23 @@ class ExtractorConfig(BaseSettings):
     week_start: date = Field(..., description="Start date of batch week")
     week_end: date = Field(..., description="End date of batch week")
 
-    # Reject policy
-    reject_threshold_pct: float = Field(default=5.0, ge=0.0, le=100.0, description="Max allowed rejected-row percentage")
-
     # Azure storage (optional)
     storage_account: str | None = Field(default=None)
     container: str | None = Field(default=None)
     adls_base_path: str = Field(default="reverse_etl/raw_events")
-    adls_rejects_base_path: str = Field(default="reverse_etl/rejected_events")
+
+    # Rejects output paths
+    adls_rejects_base_path: str = Field(default="reverse_etl/raw_events_rejects")
+
+    # Azure SQL (optional)
+    azure_sql_server: str = Field(default="reverseetl.database.windows.net")
+    azure_sql_database: str = Field(default="Reverse_ETL")
 
     # Local storage
     local_data_dir: Path = Field(default=Path("data/raw_events"))
-    local_rejects_dir: Path = Field(default=Path("data/rejected_events"))
+
+    # Local rejects dir
+    local_rejects_dir: Path = Field(default=Path("data/raw_events_rejects"))
 
     # Checkpoint/state (for Airflow resume)
     state_dir: Path = Field(default=Path("state"))
@@ -288,6 +304,9 @@ class ExtractorConfig(BaseSettings):
     api_max_retries: int = Field(default=3, ge=1, le=10)
     api_page_size: int = Field(default=1000, ge=1, le=1000, description="Records per API page (max 1000)")
     api_rate_limit_delay: float = Field(default=2.0, ge=0, description="Delay between API requests in seconds")
+
+    # ✅ NEW: Reject threshold percent (allowed rejects %)
+    reject_threshold_pct: float = Field(default=5.0, ge=0.0, le=100.0)
 
     # Logging
     log_level: str = Field(default="INFO")
@@ -334,16 +353,17 @@ class ExtractorConfig(BaseSettings):
         return self.local_output_dir / "events.parquet"
 
     @property
+    def adls_output_path(self) -> str:
+        return f"{self.adls_base_path}/week_start={self.week_start}/week_end={self.week_end}/events.parquet"
+
+    # Rejects local + ADLS paths
+    @property
     def local_rejects_output_dir(self) -> Path:
         return self.local_rejects_dir / f"week_start={self.week_start}" / f"week_end={self.week_end}"
 
     @property
     def local_rejects_output_file(self) -> Path:
         return self.local_rejects_output_dir / "rejects.parquet"
-
-    @property
-    def adls_output_path(self) -> str:
-        return f"{self.adls_base_path}/week_start={self.week_start}/week_end={self.week_end}/events.parquet"
 
     @property
     def adls_rejects_output_path(self) -> str:
@@ -374,7 +394,7 @@ class EventRecord(BaseModel):
     event_time: datetime = Field(..., description="Timestamp of the event")
     event_type: str = Field(..., description="Type of event")
 
-    # API returns numeric ids, so we store as strings (coerced)
+    # IMPORTANT: API returns numeric ids, so we store as strings (coerced)
     user_id: str = Field(..., description="Unique user identifier")
     product_id: str | None = Field(default=None)
     category_id: str | None = Field(default=None)
@@ -391,7 +411,7 @@ class EventRecord(BaseModel):
     def validate_event_type(cls, v: str) -> str:
         return v.lower().strip()
 
-    # Coerce numeric IDs from API into strings
+    # coerce numeric IDs from API into strings
     @field_validator("product_id", "category_id", "user_id", mode="before")
     @classmethod
     def coerce_ids_to_str(cls, v: Any) -> str | None:
@@ -436,10 +456,14 @@ class ValidationResult:
         return (self.valid_records / self.total_records) * 100
 
     @property
-    def reject_rate(self) -> float:
-        if self.total_records == 0:
-            return 0.0
-        return (self.invalid_records / self.total_records) * 100
+    def is_acceptable(self) -> bool:
+        return self.success_rate >= 95.0
+
+
+class RunStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    SUCCESS_WITH_REJECTS = "SUCCESS_WITH_REJECTS"
+    FAILED = "FAILED"
 
 
 @dataclass
@@ -451,12 +475,14 @@ class PipelineMetrics:
     end_time: datetime | None = None
     duration_seconds: float = 0.0
 
+    run_status: str = RunStatus.FAILED.value
+    reject_rate_pct: float = 0.0
+    reject_threshold_pct: float = 0.0
+
     rows_fetched: int = 0
     rows_validated: int = 0
-    rows_rejected: int = 0
-    reject_rate_pct: float = 0.0
-
     rows_output: int = 0
+    rows_rejected: int = 0
 
     output_file_path: str = ""
     output_file_size_bytes: int = 0
@@ -469,10 +495,9 @@ class PipelineMetrics:
     adls_uploaded: bool = False
     adls_path: str = ""
 
-    adls_rejects_uploaded: bool = False
-    adls_rejects_path: str = ""
+    rejects_adls_uploaded: bool = False
+    rejects_adls_path: str = ""
 
-    run_status: str = "FAILED"  # SUCCESS | SUCCESS_WITH_REJECTS | FAILED
     success: bool = False
     error_message: str = ""
     error_type: str = ""
@@ -483,11 +508,13 @@ class PipelineMetrics:
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "duration_seconds": round(self.duration_seconds, 2),
+            "run_status": self.run_status,
+            "reject_rate_pct": round(self.reject_rate_pct, 4),
+            "reject_threshold_pct": round(self.reject_threshold_pct, 4),
             "rows_fetched": self.rows_fetched,
             "rows_validated": self.rows_validated,
-            "rows_rejected": self.rows_rejected,
-            "reject_rate_pct": round(self.reject_rate_pct, 4),
             "rows_output": self.rows_output,
+            "rows_rejected": self.rows_rejected,
             "output_file_path": self.output_file_path,
             "output_file_size_bytes": self.output_file_size_bytes,
             "output_file_sha256": self.output_file_sha256,
@@ -496,9 +523,8 @@ class PipelineMetrics:
             "rejects_file_sha256": self.rejects_file_sha256,
             "adls_uploaded": self.adls_uploaded,
             "adls_path": self.adls_path,
-            "adls_rejects_uploaded": self.adls_rejects_uploaded,
-            "adls_rejects_path": self.adls_rejects_path,
-            "run_status": self.run_status,
+            "rejects_adls_uploaded": self.rejects_adls_uploaded,
+            "rejects_adls_path": self.rejects_adls_path,
             "success": self.success,
             "error_message": self.error_message,
             "error_type": self.error_type,
@@ -669,7 +695,6 @@ def fetch_events(
                 break
 
             page += 1
-            logger.debug(f"Rate limit delay: {rate_limit_delay}s before next request")
             time.sleep(rate_limit_delay)
 
         logger.info(
@@ -683,7 +708,6 @@ def fetch_events(
 def check_api_health(config: ExtractorConfig) -> bool:
     """Check if the API is reachable and responding."""
     session = create_http_session(config)
-
     headers = {"X-API-KEY": config.api_key}
 
     try:
@@ -709,42 +733,42 @@ OUTPUT_COLUMNS = [
     "batch_week_start", "batch_week_end", "ingested_at",
 ]
 
-REJECT_COLUMNS = [
-    "row_index",
-    "error_count",
-    "errors",
-    "raw_event",
-    "batch_week_start",
-    "batch_week_end",
-    "ingested_at",
-]
-
 
 def validate_events(events: list[dict]) -> tuple[list[dict], list[dict], ValidationResult]:
-    """Validate events against the schema. Returns (valid_events, reject_rows, result)."""
+    """
+    Validate events against the schema.
+    Returns: (valid_events, rejected_events, ValidationResult)
+    """
     from pydantic import ValidationError as PydanticValidationError
 
     valid_events: list[dict] = []
-    reject_rows: list[dict] = []
+    rejected_events: list[dict] = []
+    validation_errors: list[dict] = []
 
     for idx, event in enumerate(events):
         try:
             validated = EventRecord.model_validate(event)
             valid_events.append(validated.model_dump())
         except PydanticValidationError as e:
-            err_list = e.errors()
-            reject_rows.append({
+            rejected_events.append({
                 "row_index": idx,
-                "error_count": len(err_list),
-                "errors": err_list,
+                "error_count": len(e.errors()),
+                "errors": e.errors(),
                 "raw_event": event,
+                "rejected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+
+            validation_errors.append({
+                "row_index": idx,
+                "errors": e.errors(),
+                "raw_data": {k: str(v)[:100] for k, v in event.items()},
             })
 
     result = ValidationResult(
         total_records=len(events),
         valid_records=len(valid_events),
-        invalid_records=len(reject_rows),
-        validation_errors=reject_rows[:100],  # sample for logs/debug
+        invalid_records=len(rejected_events),
+        validation_errors=validation_errors[:100],
     )
 
     logger.info(
@@ -754,15 +778,17 @@ def validate_events(events: list[dict]) -> tuple[list[dict], list[dict], Validat
             "valid_records": result.valid_records,
             "invalid_records": result.invalid_records,
             "success_rate": f"{result.success_rate:.2f}%",
-            "reject_rate": f"{result.reject_rate:.2f}%",
         },
     )
 
-    if reject_rows:
-        for error in reject_rows[:5]:
-            logger.warning("Validation error sample", extra={"row_index": error["row_index"]})
+    if rejected_events:
+        for err in rejected_events[:5]:
+            logger.warning(
+                "Validation reject sample",
+                extra={"row_index": err["row_index"], "error_count": err["error_count"]},
+            )
 
-    return valid_events, reject_rows, result
+    return valid_events, rejected_events, result
 
 
 def normalize_events(events: list[dict], config: ExtractorConfig) -> pd.DataFrame:
@@ -772,7 +798,6 @@ def normalize_events(events: list[dict], config: ExtractorConfig) -> pd.DataFram
             return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
         df = pd.DataFrame(events)
-
         df["batch_week_start"] = config.week_start.isoformat()
         df["batch_week_end"] = config.week_end.isoformat()
         df["ingested_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -782,29 +807,24 @@ def normalize_events(events: list[dict], config: ExtractorConfig) -> pd.DataFram
                 df[col] = None
 
         df = df[OUTPUT_COLUMNS]
-
         df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
         return df
 
 
-def normalize_rejects(reject_rows: list[dict], config: ExtractorConfig) -> pd.DataFrame:
-    """Normalize rejected rows into a DataFrame for storage/replay."""
-    with log_operation(logger, "normalize_rejects", record_count=len(reject_rows)):
-        if not reject_rows:
-            return pd.DataFrame(columns=REJECT_COLUMNS)
+def normalize_rejects(rejected_events: list[dict], config: ExtractorConfig) -> pd.DataFrame:
+    """Normalize rejects into a DataFrame, with week metadata."""
+    with log_operation(logger, "normalize_rejects", reject_count=len(rejected_events)):
+        if not rejected_events:
+            return pd.DataFrame(columns=[
+                "row_index", "error_count", "errors", "raw_event", "rejected_at",
+                "batch_week_start", "batch_week_end",
+            ])
 
-        df = pd.DataFrame(reject_rows)
+        df = pd.DataFrame(rejected_events)
         df["batch_week_start"] = config.week_start.isoformat()
         df["batch_week_end"] = config.week_end.isoformat()
-        df["ingested_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-        for col in REJECT_COLUMNS:
-            if col not in df.columns:
-                df[col] = None
-
-        df = df[REJECT_COLUMNS]
         return df
 
 
@@ -836,7 +856,7 @@ def run_data_quality_checks(df: pd.DataFrame, config: ExtractorConfig, min_recor
         out_of_range = ((df["event_time"] < week_start) | (df["event_time"] > week_end)).sum()
         if out_of_range > 0:
             checks["checks"]["event_time_range"] = {"passed": False, "out_of_range_count": int(out_of_range)}
-            logger.warning("Events outside expected date range", extra={"count": out_of_range})
+            logger.warning("Events outside expected date range", extra={"count": int(out_of_range)})
         else:
             checks["checks"]["event_time_range"] = {"passed": True}
 
@@ -860,27 +880,22 @@ def transform_events(
     config: ExtractorConfig,
     strict_validation: bool = True,
     min_records: int = 1,
-) -> tuple[pd.DataFrame, pd.DataFrame, ValidationResult]:
-    """Full transformation pipeline: validate -> normalize -> quality check. Returns (df_valid, df_rejects, validation_result)."""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Full transformation pipeline: validate -> normalize(valid + rejects) -> quality check(valid)."""
     with log_operation(logger, "transform_pipeline", input_records=len(raw_events)):
-        valid_events, reject_rows, validation_result = validate_events(raw_events)
+        valid_events, rejected_events, validation_result = validate_events(raw_events)
 
-        # Strict policy: fail if reject rate > threshold
-        if strict_validation and validation_result.reject_rate > config.reject_threshold_pct:
+        if strict_validation and not validation_result.is_acceptable:
             raise SchemaValidationError(
-                f"Reject rate too high: {validation_result.reject_rate:.2f}% (threshold={config.reject_threshold_pct:.2f}%)",
-                details={
-                    "valid": validation_result.valid_records,
-                    "rejected": validation_result.invalid_records,
-                    "total": validation_result.total_records,
-                },
+                f"Validation success rate too low: {validation_result.success_rate:.1f}%",
+                details={"valid": validation_result.valid_records, "total": validation_result.total_records},
             )
 
         df_valid = normalize_events(valid_events, config)
-        df_rejects = normalize_rejects(reject_rows, config)
-
         run_data_quality_checks(df_valid, config, min_records=min_records)
-        return df_valid, df_rejects, validation_result
+
+        df_rejects = normalize_rejects(rejected_events, config)
+        return df_valid, df_rejects
 
 
 # =============================================================================
@@ -932,6 +947,14 @@ def write_parquet(df: pd.DataFrame, output_path: Path, compression: str = "snapp
             raise LocalStorageError(f"Failed to write parquet file: {e}") from e
 
 
+def write_rejects_parquet(df_rejects: pd.DataFrame, output_path: Path) -> dict | None:
+    """Write rejects to parquet if any rejects exist."""
+    if df_rejects is None or df_rejects.empty:
+        logger.info("No rejects to write")
+        return None
+    return write_parquet(df_rejects, output_path)
+
+
 def get_adls_credential():
     """Get Azure credential for ADLS access."""
     try:
@@ -942,10 +965,12 @@ def get_adls_credential():
         ) from e
 
 
-def upload_to_adls(local_file: Path, config: ExtractorConfig, adls_path: str) -> dict:
+def upload_to_adls(local_file: Path, config: ExtractorConfig) -> dict:
     """Upload file to Azure Data Lake Storage Gen2."""
     if not config.adls_enabled:
         raise AzureStorageError("ADLS upload not configured")
+
+    adls_path = config.adls_output_path
 
     with log_operation(logger, "upload_adls", storage_account=config.storage_account, path=adls_path):
         try:
@@ -978,27 +1003,70 @@ def upload_to_adls(local_file: Path, config: ExtractorConfig, adls_path: str) ->
             raise AzureStorageError(f"Azure storage operation failed: {e}") from e
 
 
-def save_outputs(
+def upload_rejects_to_adls(local_file: Path, config: ExtractorConfig) -> dict:
+    """Upload rejects file to ADLS."""
+    if not config.adls_enabled:
+        raise AzureStorageError("ADLS upload not configured")
+
+    adls_path = config.adls_rejects_output_path
+
+    with log_operation(logger, "upload_adls_rejects", storage_account=config.storage_account, path=adls_path):
+        try:
+            credential = get_adls_credential()
+            account_url = f"https://{config.storage_account}.dfs.core.windows.net"
+            service_client = DataLakeServiceClient(account_url=account_url, credential=credential)
+            fs_client = service_client.get_file_system_client(file_system=config.container)
+            file_client = fs_client.get_file_client(adls_path)
+
+            with local_file.open("rb") as f:
+                data = f.read()
+
+            file_client.upload_data(data, overwrite=True)
+
+            metadata = {
+                "storage_account": config.storage_account,
+                "container": config.container,
+                "path": adls_path,
+                "size_bytes": len(data),
+            }
+
+            logger.info("Rejects uploaded to ADLS successfully", extra=metadata)
+            return metadata
+
+        except ClientAuthenticationError as e:
+            raise AuthenticationError(
+                "Azure auth failed. Ensure 'Storage Blob Data Contributor' role is assigned."
+            ) from e
+        except (ServiceRequestError, AzureError) as e:
+            raise AzureStorageError(f"Azure storage operation failed: {e}") from e
+
+
+def save_events(
     df_valid: pd.DataFrame,
     df_rejects: pd.DataFrame,
     config: ExtractorConfig,
-    upload_to_cloud: bool = True,
+    upload_to_cloud: bool = True
 ) -> dict:
-    """Save valid + rejects to local storage and optionally upload to ADLS."""
+    """Save valid events + rejects to local storage and optionally upload both to ADLS."""
     result = {"local": None, "adls": None, "rejects_local": None, "rejects_adls": None}
 
     # Valid
     result["local"] = write_parquet(df_valid, config.local_output_file)
 
-    # Rejects (only write if any)
-    if len(df_rejects) > 0:
-        result["rejects_local"] = write_parquet(df_rejects, config.local_rejects_output_file)
+    # Rejects
+    ensure_dir(config.local_rejects_output_file.parent)
+    result["rejects_local"] = write_rejects_parquet(df_rejects, config.local_rejects_output_file)
 
     if upload_to_cloud and config.adls_enabled:
-        result["adls"] = upload_to_adls(config.local_output_file, config, config.adls_output_path)
+        # Upload valid
+        result["adls"] = upload_to_adls(config.local_output_file, config)
 
-        if result["rejects_local"] is not None:
-            result["rejects_adls"] = upload_to_adls(config.local_rejects_output_file, config, config.adls_rejects_output_path)
+        # Upload rejects if any
+        if result["rejects_local"]:
+            result["rejects_adls"] = upload_rejects_to_adls(config.local_rejects_output_file, config)
+        else:
+            logger.info("Rejects upload skipped - no rejects")
+
     elif upload_to_cloud and not config.adls_enabled:
         logger.info("ADLS upload skipped - not configured")
 
@@ -1019,7 +1087,7 @@ def read_state(config: ExtractorConfig) -> dict | None:
     if not path.exists():
         return None
     try:
-        # utf-8-sig handles BOM if present
+        # tolerate BOM files too
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as e:
         raise ConfigurationError("Failed to read state file", details={"path": str(path), "error": str(e)}) from e
@@ -1035,8 +1103,236 @@ def write_state(config: ExtractorConfig, state: dict) -> None:
 
 
 # =============================================================================
+# AZURE SQL (AAD TOKEN) + RUN/STAGE/CHECKPOINT TRACKING
+# =============================================================================
+
+SQL_COPT_SS_ACCESS_TOKEN = 1256  # ODBC attribute for AAD access token
+
+
+def _get_sql_access_token_bytes() -> bytes:
+    """
+    Returns the AAD access token bytes in the format required by ODBC:
+    4-byte little-endian length prefix + UTF-16LE token bytes.
+    """
+    cred = DefaultAzureCredential()
+    token = cred.get_token("https://database.windows.net/.default").token
+    token_bytes = token.encode("utf-16-le")
+    return (len(token_bytes)).to_bytes(4, "little") + token_bytes
+
+
+def get_sql_connection(config: ExtractorConfig) -> pyodbc.Connection:
+    """
+    DSN-less connection to Azure SQL using AAD token auth.
+    Requires: az login (works for your current setup)
+    """
+    server = getattr(config, "azure_sql_server", "reverseetl.database.windows.net")
+    database = getattr(config, "azure_sql_database", "Reverse_ETL")
+
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={server},1433;"
+        f"DATABASE={database};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
+    )
+
+    token_bytes = _get_sql_access_token_bytes()
+    return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_bytes})
+
+
+def db_get_checkpoint(config: ExtractorConfig, pipeline_name: str) -> dict | None:
+    """Read next week from dbo.pipeline_checkpoint."""
+    with get_sql_connection(config) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            SELECT pipeline_name, last_successful_week_start, last_successful_week_end,
+                   next_week_start, next_week_end
+            FROM dbo.pipeline_checkpoint
+            WHERE pipeline_name = ?
+            """,
+            pipeline_name,
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "pipeline_name": row[0],
+            "last_successful_week_start": row[1].isoformat() if row[1] else None,
+            "last_successful_week_end": row[2].isoformat() if row[2] else None,
+            "next_week_start": row[3].isoformat(),
+            "next_week_end": row[4].isoformat(),
+        }
+
+
+def db_update_checkpoint(
+    config: ExtractorConfig,
+    pipeline_name: str,
+    last_start: date,
+    last_end: date,
+    next_start: date,
+    next_end: date,
+) -> None:
+    """Upsert dbo.pipeline_checkpoint."""
+    with get_sql_connection(config) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            MERGE dbo.pipeline_checkpoint AS target
+            USING (SELECT ? AS pipeline_name) AS source
+            ON target.pipeline_name = source.pipeline_name
+            WHEN MATCHED THEN
+              UPDATE SET
+                last_successful_week_start = ?,
+                last_successful_week_end   = ?,
+                next_week_start            = ?,
+                next_week_end              = ?,
+                updated_at_utc             = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+              INSERT (pipeline_name, last_successful_week_start, last_successful_week_end, next_week_start, next_week_end)
+              VALUES (?, ?, ?, ?, ?);
+            """,
+            pipeline_name,
+            last_start,
+            last_end,
+            next_start,
+            next_end,
+            pipeline_name,
+            last_start,
+            last_end,
+            next_start,
+            next_end,
+        )
+        cn.commit()
+
+
+def db_insert_pipeline_run(config: ExtractorConfig, pipeline_name: str, metrics: PipelineMetrics) -> str:
+    """Insert dbo.pipeline_run row; returns run_id (GUID string)."""
+    run_id = str(uuid.uuid4())
+    with get_sql_connection(config) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            INSERT INTO dbo.pipeline_run (
+              run_id, pipeline_name, batch_week_start, batch_week_end,
+              pipeline_start_time, status, correlation_id,
+              reject_threshold_pct, created_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
+            """,
+            run_id,
+            pipeline_name,
+            config.week_start,
+            config.week_end,
+            metrics.start_time,
+            "STARTED",
+            metrics.correlation_id,
+            metrics.reject_threshold_pct,
+        )
+        cn.commit()
+    return run_id
+
+
+def db_finalize_pipeline_run(config: ExtractorConfig, run_id: str, metrics: PipelineMetrics) -> None:
+    """Update dbo.pipeline_run with final metrics."""
+    with get_sql_connection(config) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            UPDATE dbo.pipeline_run
+            SET
+              pipeline_end_time    = ?,
+              status               = ?,
+              rows_fetched         = ?,
+              rows_output          = ?,
+              rows_rejected        = ?,
+              reject_rate_pct      = ?,
+              reject_threshold_pct = ?,
+              output_path          = ?,
+              rejects_path         = ?,
+              error_type           = ?,
+              error_message        = ?
+            WHERE run_id = ?
+            """,
+            metrics.end_time,
+            metrics.run_status,
+            metrics.rows_fetched,
+            metrics.rows_output,
+            metrics.rows_rejected,
+            metrics.reject_rate_pct,
+            metrics.reject_threshold_pct,
+            metrics.output_file_path or None,
+            metrics.rejects_file_path or None,
+            metrics.error_type or None,
+            metrics.error_message or None,
+            run_id,
+        )
+        cn.commit()
+
+
+def db_stage_start(config: ExtractorConfig, run_id: str, stage_name: str) -> int:
+    """Insert dbo.pipeline_stage; returns stage_id."""
+    with get_sql_connection(config) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            INSERT INTO dbo.pipeline_stage (run_id, stage_name, stage_start_time, status)
+            OUTPUT INSERTED.stage_id
+            VALUES (?, ?, SYSUTCDATETIME(), ?)
+            """,
+            run_id,
+            stage_name,
+            "STARTED",
+        )
+        stage_id = cur.fetchone()[0]
+        cn.commit()
+        return int(stage_id)
+
+
+def db_stage_end(
+    config: ExtractorConfig,
+    stage_id: int,
+    status: str,
+    row_count: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    with get_sql_connection(config) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """
+            UPDATE dbo.pipeline_stage
+            SET stage_end_time = SYSUTCDATETIME(),
+                status = ?,
+                row_count = ?,
+                error_message = ?
+            WHERE stage_id = ?
+            """,
+            status,
+            row_count,
+            error_message,
+            stage_id,
+        )
+        cn.commit()
+
+
+# =============================================================================
 # ORCHESTRATION
 # =============================================================================
+
+
+def compute_reject_rate_pct(rows_rejected: int, rows_fetched: int) -> float:
+    if rows_fetched <= 0:
+        return 0.0
+    return (rows_rejected / rows_fetched) * 100.0
+
+
+def decide_run_status(reject_rate_pct: float, rows_rejected: int, threshold_pct: float) -> str:
+    if rows_rejected <= 0:
+        return RunStatus.SUCCESS.value
+    if reject_rate_pct <= threshold_pct:
+        return RunStatus.SUCCESS_WITH_REJECTS.value
+    return RunStatus.FAILED.value
 
 
 def run_pipeline(
@@ -1050,9 +1346,19 @@ def run_pipeline(
     start_time = perf_counter()
     metrics = PipelineMetrics(correlation_id=CorrelationIdFilter.generate_correlation_id())
 
+    pipeline_name = "reverse_etl_events"
+    run_id = None
+    
+    try:
+        run_id = db_insert_pipeline_run(config, pipeline_name, metrics)
+    except Exception as e:
+        logger.warning("DB run insert failed; continuing without DB audit", extra={"error": str(e)})
+
     try:
         if config is None:
             config = get_config()
+
+        metrics.reject_threshold_pct = float(config.reject_threshold_pct)
 
         logger.info(
             "Starting extraction pipeline",
@@ -1067,78 +1373,181 @@ def run_pipeline(
         if skip_if_exists and check_output_exists(config):
             logger.info("Output file already exists - skipping", extra={"path": str(config.local_output_file)})
             metrics.success = True
-            metrics.run_status = "SUCCESS"
+            metrics.run_status = RunStatus.SUCCESS.value
             metrics.output_file_path = str(config.local_output_file)
             return metrics
 
-        with log_operation(logger, "extract_phase"):
-            raw_events = fetch_events(config)
-            metrics.rows_fetched = len(raw_events)
+        # ============================================================
+        # EXTRACT PHASE - with stage tracking
+        # ============================================================
+        stage_id = None
+        try:
+            if run_id:
+                stage_id = db_stage_start(config, run_id, "EXTRACT")
 
-        with log_operation(logger, "transform_phase"):
-            df_valid, df_rejects, validation_result = transform_events(
-                raw_events,
-                config,
-                strict_validation=strict_validation,
-                min_records=0 if dry_run else 1,
-            )
-            metrics.rows_validated = len(df_valid)
-            metrics.rows_rejected = validation_result.invalid_records
-            metrics.reject_rate_pct = validation_result.reject_rate
-            metrics.rows_output = len(df_valid)
+            with log_operation(logger, "extract_phase"):
+                raw_events = fetch_events(config)
+                metrics.rows_fetched = len(raw_events)
 
+            if run_id and stage_id:
+                db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_fetched)
+
+        except Exception as e:
+            if run_id and stage_id:
+                db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+            raise
+
+        # ============================================================
+        # TRANSFORM PHASE - with stage tracking
+        # ============================================================
+        stage_id = None
+        try:
+            if run_id:
+                stage_id = db_stage_start(config, run_id, "TRANSFORM")
+
+            with log_operation(logger, "transform_phase"):
+                df_valid, df_rejects = transform_events(
+                    raw_events,
+                    config,
+                    strict_validation=strict_validation,
+                    min_records=0 if dry_run else 1,
+                )
+                metrics.rows_validated = len(df_valid)
+                metrics.rows_output = len(df_valid)
+                metrics.rows_rejected = 0 if df_rejects is None else len(df_rejects)
+
+                metrics.reject_rate_pct = compute_reject_rate_pct(metrics.rows_rejected, metrics.rows_fetched)
+                metrics.run_status = decide_run_status(
+                    reject_rate_pct=metrics.reject_rate_pct,
+                    rows_rejected=metrics.rows_rejected,
+                    threshold_pct=float(config.reject_threshold_pct),
+                )
+
+                logger.info(
+                    "Rejects summary",
+                    extra={
+                        "rows_fetched": metrics.rows_fetched,
+                        "rows_rejected": metrics.rows_rejected,
+                        "reject_rate_pct": round(metrics.reject_rate_pct, 4),
+                        "reject_threshold_pct": config.reject_threshold_pct,
+                        "run_status": metrics.run_status,
+                    },
+                )
+
+            if run_id and stage_id:
+                db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_output)
+
+        except Exception as e:
+            if run_id and stage_id:
+                db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+            raise
+
+        # Check if reject threshold was breached
+        fail_due_to_rejects = (metrics.run_status == RunStatus.FAILED.value)
+
+        # ============================================================
+        # LOAD PHASE - with stage tracking (only if not dry_run)
+        # ============================================================
         if not dry_run:
-            with log_operation(logger, "load_phase"):
-                save_result = save_outputs(df_valid, df_rejects, config, upload_to_cloud=upload_to_cloud)
+            stage_id = None
+            try:
+                if run_id:
+                    stage_id = db_stage_start(config, run_id, "LOAD")
 
-                if save_result["local"]:
-                    metrics.output_file_path = save_result["local"]["path"]
-                    metrics.output_file_size_bytes = save_result["local"]["size_bytes"]
-                    metrics.output_file_sha256 = save_result["local"]["sha256"]
+                with log_operation(logger, "load_phase"):
+                    save_result = save_events(df_valid, df_rejects, config, upload_to_cloud=upload_to_cloud)
 
-                if save_result["rejects_local"]:
-                    metrics.rejects_file_path = save_result["rejects_local"]["path"]
-                    metrics.rejects_file_size_bytes = save_result["rejects_local"]["size_bytes"]
-                    metrics.rejects_file_sha256 = save_result["rejects_local"]["sha256"]
+                    if save_result["local"]:
+                        metrics.output_file_path = save_result["local"]["path"]
+                        metrics.output_file_size_bytes = save_result["local"]["size_bytes"]
+                        metrics.output_file_sha256 = save_result["local"]["sha256"]
 
-                if save_result["adls"]:
-                    metrics.adls_uploaded = True
-                    metrics.adls_path = save_result["adls"]["path"]
+                    if save_result.get("rejects_local"):
+                        metrics.rejects_file_path = save_result["rejects_local"]["path"]
+                        metrics.rejects_file_size_bytes = save_result["rejects_local"]["size_bytes"]
+                        metrics.rejects_file_sha256 = save_result["rejects_local"]["sha256"]
 
-                if save_result["rejects_adls"]:
-                    metrics.adls_rejects_uploaded = True
-                    metrics.adls_rejects_path = save_result["rejects_adls"]["path"]
+                    if save_result["adls"]:
+                        metrics.adls_uploaded = True
+                        metrics.adls_path = save_result["adls"]["path"]
+
+                    if save_result.get("rejects_adls"):
+                        metrics.rejects_adls_uploaded = True
+                        metrics.rejects_adls_path = save_result["rejects_adls"]["path"]
+
+                if run_id and stage_id:
+                    db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_output)
+
+            except Exception as e:
+                if run_id and stage_id:
+                    db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                raise
         else:
             logger.info("Dry run - skipping file output")
 
-        # Run status
-        if metrics.rows_rejected == 0:
-            metrics.run_status = "SUCCESS"
-        else:
-            metrics.run_status = "SUCCESS_WITH_REJECTS"
+        # ============================================================
+        # QUALITY GATE - reject threshold breach check
+        # ============================================================
+        if fail_due_to_rejects:
+            metrics.success = False
+            metrics.error_type = "DataQualityError"
+            metrics.error_message = (
+                f"Reject rate {metrics.reject_rate_pct:.4f}% exceeds threshold {config.reject_threshold_pct:.4f}%"
+            )
+            
+            # Record this failure as a separate stage for visibility
+            if run_id:
+                gate_stage_id = db_stage_start(config, run_id, "QUALITY_GATE")
+                db_stage_end(
+                    config,
+                    gate_stage_id,
+                    "FAILED",
+                    row_count=metrics.rows_output,
+                    error_message=f"Reject rate {metrics.reject_rate_pct:.6f}% exceeded threshold {config.reject_threshold_pct:.6f}%",
+                )
+            
+            logger.error("Pipeline failed due to reject threshold breach", extra=metrics.to_dict())
+            raise DataQualityError(
+                "Reject threshold exceeded",
+                details={
+                    "reject_rate_pct": metrics.reject_rate_pct,
+                    "reject_threshold_pct": config.reject_threshold_pct,
+                    "rows_fetched": metrics.rows_fetched,
+                    "rows_rejected": metrics.rows_rejected,
+                    "rejects_file_path": metrics.rejects_file_path,
+                    "rejects_adls_path": metrics.rejects_adls_path,
+                },
+            )
 
         metrics.success = True
         logger.info("Pipeline completed successfully", extra=metrics.to_dict())
 
     except ExtractorError as e:
         metrics.success = False
-        metrics.run_status = "FAILED"
         metrics.error_message = str(e)
         metrics.error_type = type(e).__name__
+        metrics.run_status = RunStatus.FAILED.value
         logger.error(f"Pipeline failed: {e}", extra=metrics.to_dict())
         raise
 
     except Exception as e:
         metrics.success = False
-        metrics.run_status = "FAILED"
         metrics.error_message = str(e)
         metrics.error_type = type(e).__name__
+        metrics.run_status = RunStatus.FAILED.value
         logger.error(f"Unexpected error: {e}", extra=metrics.to_dict(), exc_info=True)
         raise ExtractorError(f"Unexpected error: {e}") from e
 
     finally:
         metrics.end_time = datetime.now(timezone.utc)
         metrics.duration_seconds = perf_counter() - start_time
+        
+        # Finalize DB run tracking - this writes error_message to pipeline_run
+        if run_id:
+            try:
+                db_finalize_pipeline_run(config, run_id, metrics)
+            except Exception as e:
+                logger.warning("DB run finalize failed", extra={"error": str(e), "run_id": run_id})
 
     return metrics
 
@@ -1151,15 +1560,14 @@ def run_pipeline(
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Extract weekly event data from API to data lake",
+        description="Extract weekly event data from API to data warehouse",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python extractor/extract_events.py
-  python extractor/extract_events.py --week-start 2019-12-01 --week-end 2019-12-07
-  python extractor/extract_events.py --use-checkpoint
-  python extractor/extract_events.py --use-checkpoint --advance-on-skip
-  python extractor/extract_events.py --use-checkpoint --no-strict-validation
+  python extract_events.py
+  python extract_events.py --week-start 2024-01-08 --week-end 2024-01-14
+  python extract_events.py --use-checkpoint
+  python extract_events.py --use-checkpoint --advance-on-skip
         """,
     )
 
@@ -1171,9 +1579,6 @@ Examples:
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     parser.add_argument("--log-format", choices=["json", "text"], default="json")
     parser.add_argument("--check-api", action="store_true", help="Check API health and exit")
-
-    # Strict policy toggle
-    parser.add_argument("--no-strict-validation", action="store_true", help="Do not fail if reject rate exceeds threshold")
 
     # Airflow-friendly resume
     parser.add_argument("--use-checkpoint", action="store_true", help="Use state file to select next week to run")
@@ -1190,7 +1595,6 @@ Examples:
 def main() -> int:
     """Main entry point for CLI execution."""
     args = parse_args()
-
     setup_logging(level=args.log_level, json_format=(args.log_format == "json"))
 
     try:
@@ -1202,24 +1606,28 @@ def main() -> int:
             config.state_dir = p.parent
             config.state_file_name = p.name
 
+        pipeline_name = "reverse_etl_events"  # keep consistent with your SQL row
+
         # If using checkpoint, load next week from state (ONLY when week-start/week-end not provided)
         if args.use_checkpoint and (not args.week_start) and (not args.week_end):
-            state = read_state(config)
+            # DB-first checkpoint; JSON fallback
+            state = None
+            try:
+                state = db_get_checkpoint(config, pipeline_name)
+                if state:
+                    logger.info("Loaded DB checkpoint week", extra=state)
+            except Exception as e:
+                logger.warning("DB checkpoint read failed; falling back to JSON state", extra={"error": str(e)})
+
+            if not state:
+                state = read_state(config)
+
             if state and state.get("next_week_start"):
                 config.week_start = date.fromisoformat(state["next_week_start"])
-                if state.get("next_week_end"):
-                    config.week_end = date.fromisoformat(state["next_week_end"])
-                else:
-                    config.week_end = compute_week_end(config.week_start)
-                logger.info(
-                    "Loaded checkpoint week",
-                    extra={"week_start": str(config.week_start), "week_end": str(config.week_end)},
-                )
+                config.week_end = date.fromisoformat(state.get("next_week_end")) if state.get("next_week_end") else compute_week_end(config.week_start)
+                logger.info("Loaded checkpoint week", extra={"week_start": str(config.week_start), "week_end": str(config.week_end)})
             else:
-                logger.info(
-                    "No checkpoint found; using config.env week range",
-                    extra={"week_start": str(config.week_start), "week_end": str(config.week_end)},
-                )
+                logger.info("No checkpoint found; using config.env week range", extra={"week_start": str(config.week_start), "week_end": str(config.week_end)})
 
         # Override from CLI (explicit week always wins)
         if args.week_start:
@@ -1233,33 +1641,38 @@ def main() -> int:
             logger.info("API health check " + ("passed" if healthy else "failed"))
             return 0 if healthy else 1
 
-        strict_validation = not args.no_strict_validation
-
         # Run pipeline (one week)
         metrics = run_pipeline(
             config=config,
             skip_if_exists=not args.force,
             upload_to_cloud=not args.local_only,
             dry_run=args.dry_run,
-            strict_validation=strict_validation,
         )
 
-        # Update checkpoint ONLY on SUCCESS / SUCCESS_WITH_REJECTS (and not dry-run)
-        if metrics.success and (not args.dry_run) and args.use_checkpoint:
+        # Advance checkpoint only when run_status is SUCCESS or SUCCESS_WITH_REJECTS (and within threshold)
+        if (not args.dry_run) and args.use_checkpoint:
             was_skipped = (metrics.rows_fetched == 0) and (not args.force) and check_output_exists(config)
+            ok_to_advance = metrics.run_status in {RunStatus.SUCCESS.value, RunStatus.SUCCESS_WITH_REJECTS.value}
 
-            # If skipped, only advance if requested
-            if was_skipped and (not args.advance_on_skip):
-                logger.info("Pipeline skipped and advance-on-skip not set; checkpoint not advanced")
-                return 0
-
-            # IMPORTANT: do not advance if run was "FAILED" (already ensured by metrics.success)
-            # Also, for strict mode: this will only reach here if reject_rate <= threshold (because otherwise it raises)
-            # For non-strict mode: we still only advance if reject_rate <= threshold (so reruns won’t skip bad weeks).
-            if metrics.reject_rate_pct <= config.reject_threshold_pct:
+            if ok_to_advance and ((not was_skipped) or args.advance_on_skip):
                 next_week_start = config.week_end + timedelta(days=1)
                 next_week_end = compute_week_end(next_week_start)
 
+                # Update DB checkpoint first (best practice)
+                try:
+                    db_update_checkpoint(
+                        config,
+                        pipeline_name=pipeline_name,
+                        last_start=config.week_start,
+                        last_end=config.week_end,
+                        next_start=next_week_start,
+                        next_end=next_week_end,
+                    )
+                    logger.info("DB checkpoint updated", extra={"pipeline_name": pipeline_name, "next_week_start": str(next_week_start), "next_week_end": str(next_week_end)})
+                except Exception as e:
+                    logger.warning("DB checkpoint update failed; JSON state will still be written", extra={"error": str(e)})
+
+                # Still write JSON state as backup
                 new_state = {
                     "last_successful_week_start": str(config.week_start),
                     "last_successful_week_end": str(config.week_end),
@@ -1267,18 +1680,28 @@ def main() -> int:
                     "next_week_end": str(next_week_end),
                     "updated_at_utc": datetime.now(timezone.utc).isoformat(),
                     "last_run_correlation_id": metrics.correlation_id,
+                    "last_run_status": metrics.run_status,
+                    "last_reject_rate_pct": round(metrics.reject_rate_pct, 6),
+                    "reject_threshold_pct": round(metrics.reject_threshold_pct, 6),
                     "last_output_file_path": metrics.output_file_path,
                     "last_rows_output": metrics.rows_output,
-                    "last_run_status": metrics.run_status,
-                    "last_reject_rate_pct": round(metrics.reject_rate_pct, 4),
+                    "last_rows_rejected": metrics.rows_rejected,
                     "last_rejects_file_path": metrics.rejects_file_path,
+                    "last_rejects_adls_path": metrics.rejects_adls_path,
                 }
                 write_state(config, new_state)
             else:
-                logger.warning(
-                    "Reject rate above threshold; checkpoint not advanced",
-                    extra={"reject_rate_pct": metrics.reject_rate_pct, "threshold_pct": config.reject_threshold_pct},
-                )
+                if not ok_to_advance:
+                    logger.warning(
+                        "Checkpoint not advanced because run_status is FAILED",
+                        extra={
+                            "run_status": metrics.run_status,
+                            "reject_rate_pct": round(metrics.reject_rate_pct, 4),
+                            "reject_threshold_pct": round(metrics.reject_threshold_pct, 4),
+                        },
+                    )
+                else:
+                    logger.info("Pipeline skipped and advance-on-skip not set; checkpoint not advanced")
 
         return 0 if metrics.success else 1
 
