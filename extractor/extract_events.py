@@ -24,6 +24,18 @@ Event Extraction Pipeline (Single-File Version)
 - Reads/writes checkpoint from dbo.pipeline_checkpoint (with JSON fallback)
 - Uses AAD token authentication for Azure SQL
 - Enhanced stage error tracking for all phases (EXTRACT, TRANSFORM, LOAD, QUALITY_GATE)
+
+(NEW) DB-first checkpoint pattern:
+- DB checkpoint is REQUIRED for reads (no fallback to JSON)
+- DB writes are best-effort (failures logged but don't stop pipeline)
+- JSON is always synced as mirror/backup
+- Failed DB writes saved to pending_db_updates.jsonl for auto-recovery
+
+(NEW) Auto-replay pending DB updates:
+- Failed DB writes are saved to pending_db_updates.jsonl (JSON Lines format)
+- On next run, pending updates are automatically replayed before checkpoint read
+- Production-safe: failures are logged but don't stop pipeline
+- No manual intervention needed
 """
 
 from __future__ import annotations
@@ -133,6 +145,11 @@ class AzureStorageError(StorageError):
 
 class AuthenticationError(ExtractorError):
     """Raised when authentication fails."""
+    pass
+
+
+class CheckpointError(ExtractorError):
+    """Raised when checkpoint operations fail."""
     pass
 
 
@@ -298,6 +315,7 @@ class ExtractorConfig(BaseSettings):
     # Checkpoint/state (for Airflow resume)
     state_dir: Path = Field(default=Path("state"))
     state_file_name: str = Field(default="extractor_state.json")
+    pending_updates_file_name: str = Field(default="pending_db_updates.jsonl")
 
     # API settings
     api_timeout_seconds: int = Field(default=60, ge=1, le=300)
@@ -372,6 +390,10 @@ class ExtractorConfig(BaseSettings):
     @property
     def state_file(self) -> Path:
         return self.state_dir / self.state_file_name
+
+    @property
+    def pending_updates_file(self) -> Path:
+        return self.state_dir / self.pending_updates_file_name
 
 
 def get_config() -> ExtractorConfig:
@@ -1074,7 +1096,7 @@ def save_events(
 
 
 # =============================================================================
-# CHECKPOINT / STATE
+# CHECKPOINT / STATE (DB-FIRST PATTERN)
 # =============================================================================
 
 
@@ -1082,24 +1104,71 @@ def compute_week_end(week_start: date, days: int = 6) -> date:
     return week_start + timedelta(days=days)
 
 
-def read_state(config: ExtractorConfig) -> dict | None:
+def read_json_state(config: ExtractorConfig) -> dict | None:
+    """Read state from JSON file (backup/mirror only)."""
     path = config.state_file
     if not path.exists():
         return None
     try:
-        # tolerate BOM files too
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as e:
-        raise ConfigurationError("Failed to read state file", details={"path": str(path), "error": str(e)}) from e
+        logger.warning("Failed to read JSON state file", extra={"path": str(path), "error": str(e)})
+        return None
 
 
-def write_state(config: ExtractorConfig, state: dict) -> None:
+def write_json_state(config: ExtractorConfig, state: dict) -> None:
+    """Write state to JSON file (always sync as mirror/backup)."""
     try:
         ensure_dir(config.state_dir)
         config.state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        logger.info("State updated", extra={"state_path": str(config.state_file)})
+        logger.info("JSON state synchronized", extra={"state_path": str(config.state_file)})
     except Exception as e:
-        raise LocalStorageError("Failed to write state file", details={"path": str(config.state_file), "error": str(e)}) from e
+        logger.error("Failed to write JSON state file", extra={"path": str(config.state_file), "error": str(e)})
+
+
+def append_pending_db_update(config: ExtractorConfig, payload: dict) -> None:
+    """Append a failed DB update to pending file (JSONL format - one update per line)."""
+    try:
+        ensure_dir(config.pending_updates_file.parent)
+        with config.pending_updates_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+        logger.warning(
+            "DB update saved to pending file for replay on next run",
+            extra={"pending_file": str(config.pending_updates_file)}
+        )
+    except Exception as e:
+        logger.error("Failed to save pending DB update", extra={"error": str(e)})
+
+
+def read_pending_db_updates(config: ExtractorConfig) -> list[dict]:
+    """Read all pending DB updates from JSONL file."""
+    if not config.pending_updates_file.exists():
+        return []
+    
+    updates: list[dict] = []
+    with config.pending_updates_file.open("r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                updates.append(json.loads(line))
+            except Exception as e:
+                # Skip bad lines instead of breaking everything
+                logger.warning(
+                    "Skipping malformed pending update",
+                    extra={"line_num": line_num, "error": str(e)}
+                )
+                continue
+    return updates
+
+
+def rewrite_pending_db_updates(config: ExtractorConfig, remaining: list[dict]) -> None:
+    """Rewrite pending updates file with only remaining (unflushed) updates."""
+    ensure_dir(config.pending_updates_file.parent)
+    with config.pending_updates_file.open("w", encoding="utf-8") as f:
+        for item in remaining:
+            f.write(json.dumps(item) + "\n")
 
 
 # =============================================================================
@@ -1141,29 +1210,45 @@ def get_sql_connection(config: ExtractorConfig) -> pyodbc.Connection:
     return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_bytes})
 
 
-def db_get_checkpoint(config: ExtractorConfig, pipeline_name: str) -> dict | None:
-    """Read next week from dbo.pipeline_checkpoint."""
-    with get_sql_connection(config) as cn:
-        cur = cn.cursor()
-        cur.execute(
-            """
-            SELECT pipeline_name, last_successful_week_start, last_successful_week_end,
-                   next_week_start, next_week_end
-            FROM dbo.pipeline_checkpoint
-            WHERE pipeline_name = ?
-            """,
-            pipeline_name,
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "pipeline_name": row[0],
-            "last_successful_week_start": row[1].isoformat() if row[1] else None,
-            "last_successful_week_end": row[2].isoformat() if row[2] else None,
-            "next_week_start": row[3].isoformat(),
-            "next_week_end": row[4].isoformat(),
-        }
+def db_get_checkpoint(config: ExtractorConfig, pipeline_name: str) -> dict:
+    """
+    Read next week from dbo.pipeline_checkpoint.
+    ⚠️ DB-FIRST PATTERN: This is REQUIRED - no fallback to JSON.
+    Raises CheckpointError if unable to read from DB.
+    """
+    try:
+        with get_sql_connection(config) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                """
+                SELECT pipeline_name, last_successful_week_start, last_successful_week_end,
+                       next_week_start, next_week_end
+                FROM dbo.pipeline_checkpoint
+                WHERE pipeline_name = ?
+                """,
+                pipeline_name,
+            )
+            row = cur.fetchone()
+            if not row:
+                logger.info("No checkpoint found in DB - will use config.env defaults")
+                return None
+            
+            checkpoint = {
+                "pipeline_name": row[0],
+                "last_successful_week_start": row[1].isoformat() if row[1] else None,
+                "last_successful_week_end": row[2].isoformat() if row[2] else None,
+                "next_week_start": row[3].isoformat(),
+                "next_week_end": row[4].isoformat(),
+            }
+            logger.info("Loaded checkpoint from DB", extra=checkpoint)
+            return checkpoint
+            
+    except Exception as e:
+        logger.error("FATAL: Unable to read checkpoint from DB", extra={"error": str(e)})
+        raise CheckpointError(
+            "Failed to read checkpoint from database - cannot proceed",
+            details={"pipeline_name": pipeline_name, "error": str(e)}
+        ) from e
 
 
 def db_update_checkpoint(
@@ -1174,120 +1259,153 @@ def db_update_checkpoint(
     next_start: date,
     next_end: date,
 ) -> None:
-    """Upsert dbo.pipeline_checkpoint."""
-    with get_sql_connection(config) as cn:
-        cur = cn.cursor()
-        cur.execute(
-            """
-            MERGE dbo.pipeline_checkpoint AS target
-            USING (SELECT ? AS pipeline_name) AS source
-            ON target.pipeline_name = source.pipeline_name
-            WHEN MATCHED THEN
-              UPDATE SET
-                last_successful_week_start = ?,
-                last_successful_week_end   = ?,
-                next_week_start            = ?,
-                next_week_end              = ?,
-                updated_at_utc             = SYSUTCDATETIME()
-            WHEN NOT MATCHED THEN
-              INSERT (pipeline_name, last_successful_week_start, last_successful_week_end, next_week_start, next_week_end)
-              VALUES (?, ?, ?, ?, ?);
-            """,
-            pipeline_name,
-            last_start,
-            last_end,
-            next_start,
-            next_end,
-            pipeline_name,
-            last_start,
-            last_end,
-            next_start,
-            next_end,
-        )
-        cn.commit()
+    """
+    Upsert dbo.pipeline_checkpoint.
+    ⚠️ BEST EFFORT: Failures are logged but don't stop the pipeline.
+    """
+    try:
+        with get_sql_connection(config) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                """
+                MERGE dbo.pipeline_checkpoint AS target
+                USING (SELECT ? AS pipeline_name) AS source
+                ON target.pipeline_name = source.pipeline_name
+                WHEN MATCHED THEN
+                  UPDATE SET
+                    last_successful_week_start = ?,
+                    last_successful_week_end   = ?,
+                    next_week_start            = ?,
+                    next_week_end              = ?,
+                    updated_at_utc             = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                  INSERT (pipeline_name, last_successful_week_start, last_successful_week_end, next_week_start, next_week_end)
+                  VALUES (?, ?, ?, ?, ?);
+                """,
+                pipeline_name,
+                last_start,
+                last_end,
+                next_start,
+                next_end,
+                pipeline_name,
+                last_start,
+                last_end,
+                next_start,
+                next_end,
+            )
+            cn.commit()
+        logger.info("DB checkpoint updated successfully")
+    except Exception as e:
+        logger.error("DB checkpoint update failed", extra={"error": str(e), "pipeline_name": pipeline_name})
+        raise
 
 
 def db_insert_pipeline_run(config: ExtractorConfig, pipeline_name: str, metrics: PipelineMetrics) -> str:
-    """Insert dbo.pipeline_run row; returns run_id (GUID string)."""
+    """
+    Insert dbo.pipeline_run row; returns run_id (GUID string).
+    ⚠️ BEST EFFORT: Failures are logged but don't stop the pipeline.
+    """
     run_id = str(uuid.uuid4())
-    with get_sql_connection(config) as cn:
-        cur = cn.cursor()
-        cur.execute(
-            """
-            INSERT INTO dbo.pipeline_run (
-              run_id, pipeline_name, batch_week_start, batch_week_end,
-              pipeline_start_time, status, correlation_id,
-              reject_threshold_pct, created_at_utc
+    try:
+        with get_sql_connection(config) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                """
+                INSERT INTO dbo.pipeline_run (
+                  run_id, pipeline_name, batch_week_start, batch_week_end,
+                  pipeline_start_time, status, correlation_id,
+                  reject_threshold_pct, created_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
+                """,
+                run_id,
+                pipeline_name,
+                config.week_start,
+                config.week_end,
+                metrics.start_time,
+                "STARTED",
+                metrics.correlation_id,
+                metrics.reject_threshold_pct,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
-            """,
-            run_id,
-            pipeline_name,
-            config.week_start,
-            config.week_end,
-            metrics.start_time,
-            "STARTED",
-            metrics.correlation_id,
-            metrics.reject_threshold_pct,
-        )
-        cn.commit()
+            cn.commit()
+        logger.info("Pipeline run inserted to DB", extra={"run_id": run_id})
+    except Exception as e:
+        logger.error("DB run insert failed", extra={"error": str(e), "run_id": run_id})
+        raise
+    
     return run_id
 
 
 def db_finalize_pipeline_run(config: ExtractorConfig, run_id: str, metrics: PipelineMetrics) -> None:
-    """Update dbo.pipeline_run with final metrics."""
-    with get_sql_connection(config) as cn:
-        cur = cn.cursor()
-        cur.execute(
-            """
-            UPDATE dbo.pipeline_run
-            SET
-              pipeline_end_time    = ?,
-              status               = ?,
-              rows_fetched         = ?,
-              rows_output          = ?,
-              rows_rejected        = ?,
-              reject_rate_pct      = ?,
-              reject_threshold_pct = ?,
-              output_path          = ?,
-              rejects_path         = ?,
-              error_type           = ?,
-              error_message        = ?
-            WHERE run_id = ?
-            """,
-            metrics.end_time,
-            metrics.run_status,
-            metrics.rows_fetched,
-            metrics.rows_output,
-            metrics.rows_rejected,
-            metrics.reject_rate_pct,
-            metrics.reject_threshold_pct,
-            metrics.output_file_path or None,
-            metrics.rejects_file_path or None,
-            metrics.error_type or None,
-            metrics.error_message or None,
-            run_id,
-        )
-        cn.commit()
+    """
+    Update dbo.pipeline_run with final metrics.
+    ⚠️ BEST EFFORT: Failures are logged but don't stop the pipeline.
+    """
+    try:
+        with get_sql_connection(config) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                """
+                UPDATE dbo.pipeline_run
+                SET
+                  pipeline_end_time    = ?,
+                  status               = ?,
+                  rows_fetched         = ?,
+                  rows_output          = ?,
+                  rows_rejected        = ?,
+                  reject_rate_pct      = ?,
+                  reject_threshold_pct = ?,
+                  output_path          = ?,
+                  rejects_path         = ?,
+                  error_type           = ?,
+                  error_message        = ?
+                WHERE run_id = ?
+                """,
+                metrics.end_time,
+                metrics.run_status,
+                metrics.rows_fetched,
+                metrics.rows_output,
+                metrics.rows_rejected,
+                metrics.reject_rate_pct,
+                metrics.reject_threshold_pct,
+                metrics.output_file_path or None,
+                metrics.rejects_file_path or None,
+                metrics.error_type or None,
+                metrics.error_message or None,
+                run_id,
+            )
+            cn.commit()
+        logger.info("Pipeline run finalized in DB", extra={"run_id": run_id})
+    except Exception as e:
+        logger.error("DB run finalize failed", extra={"error": str(e), "run_id": run_id})
+        raise
 
 
 def db_stage_start(config: ExtractorConfig, run_id: str, stage_name: str) -> int:
-    """Insert dbo.pipeline_stage; returns stage_id."""
-    with get_sql_connection(config) as cn:
-        cur = cn.cursor()
-        cur.execute(
-            """
-            INSERT INTO dbo.pipeline_stage (run_id, stage_name, stage_start_time, status)
-            OUTPUT INSERTED.stage_id
-            VALUES (?, ?, SYSUTCDATETIME(), ?)
-            """,
-            run_id,
-            stage_name,
-            "STARTED",
-        )
-        stage_id = cur.fetchone()[0]
-        cn.commit()
+    """
+    Insert dbo.pipeline_stage; returns stage_id.
+    ⚠️ BEST EFFORT: Failures are logged but don't stop the pipeline.
+    """
+    try:
+        with get_sql_connection(config) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                """
+                INSERT INTO dbo.pipeline_stage (run_id, stage_name, stage_start_time, status)
+                OUTPUT INSERTED.stage_id
+                VALUES (?, ?, SYSUTCDATETIME(), ?)
+                """,
+                run_id,
+                stage_name,
+                "STARTED",
+            )
+            stage_id = cur.fetchone()[0]
+            cn.commit()
+        logger.info("Stage started in DB", extra={"run_id": run_id, "stage_name": stage_name, "stage_id": stage_id})
         return int(stage_id)
+    except Exception as e:
+        logger.error("DB stage start failed", extra={"error": str(e), "run_id": run_id, "stage_name": stage_name})
+        raise
 
 
 def db_stage_end(
@@ -1297,23 +1415,119 @@ def db_stage_end(
     row_count: int | None = None,
     error_message: str | None = None,
 ) -> None:
-    with get_sql_connection(config) as cn:
-        cur = cn.cursor()
-        cur.execute(
-            """
-            UPDATE dbo.pipeline_stage
-            SET stage_end_time = SYSUTCDATETIME(),
-                status = ?,
-                row_count = ?,
-                error_message = ?
-            WHERE stage_id = ?
-            """,
-            status,
-            row_count,
-            error_message,
-            stage_id,
-        )
-        cn.commit()
+    """
+    Update dbo.pipeline_stage with completion status.
+    ⚠️ BEST EFFORT: Failures are logged but don't stop the pipeline.
+    """
+    try:
+        with get_sql_connection(config) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                """
+                UPDATE dbo.pipeline_stage
+                SET stage_end_time = SYSUTCDATETIME(),
+                    status = ?,
+                    row_count = ?,
+                    error_message = ?
+                WHERE stage_id = ?
+                """,
+                status,
+                row_count,
+                error_message,
+                stage_id,
+            )
+            cn.commit()
+        logger.info("Stage ended in DB", extra={"stage_id": stage_id, "status": status})
+    except Exception as e:
+        logger.error("DB stage end failed", extra={"error": str(e), "stage_id": stage_id})
+        raise
+
+
+def flush_pending_db_updates(config: ExtractorConfig) -> None:
+    """
+    Auto-replay pending DB updates from previous failed runs.
+    This is called AFTER DB connection is established but BEFORE reading checkpoint.
+    
+    Production-safe:
+    - If flush succeeds → remove from pending file
+    - If flush fails → keep in pending file for next run
+    - Pipeline continues regardless of flush outcome
+    """
+    pending = read_pending_db_updates(config)
+    if not pending:
+        logger.debug("No pending DB updates to flush")
+        return
+
+    logger.info("Found pending DB updates to replay", extra={"count": len(pending)})
+
+    remaining: list[dict] = []
+    flushed_count = 0
+
+    for idx, item in enumerate(pending, 1):
+        correlation_id = None
+        try:
+            run_payload = item.get("run")
+            checkpoint_payload = item.get("checkpoint")
+            failed_at_utc = item.get("failed_at_utc")
+
+            if run_payload:
+                correlation_id = run_payload.get("correlation_id")
+            
+            logger.info(
+                f"Replaying pending update {idx}/{len(pending)}",
+                extra={
+                    "correlation_id": correlation_id,
+                    "originally_failed_at": failed_at_utc,
+                    "has_run_payload": run_payload is not None,
+                    "has_checkpoint_payload": checkpoint_payload is not None,
+                }
+            )
+
+            # Replay checkpoint update
+            if checkpoint_payload:
+                pipeline_name = checkpoint_payload.get("pipeline_name")
+                last_start = date.fromisoformat(checkpoint_payload["last_successful_week_start"])
+                last_end = date.fromisoformat(checkpoint_payload["last_successful_week_end"])
+                next_start = date.fromisoformat(checkpoint_payload["next_week_start"])
+                next_end = date.fromisoformat(checkpoint_payload["next_week_end"])
+                
+                db_update_checkpoint(
+                    config,
+                    pipeline_name=pipeline_name,
+                    last_start=last_start,
+                    last_end=last_end,
+                    next_start=next_start,
+                    next_end=next_end,
+                )
+                logger.info(
+                    "Successfully replayed checkpoint update",
+                    extra={"correlation_id": correlation_id}
+                )
+
+            flushed_count += 1
+
+        except Exception as e:
+            logger.error(
+                "Failed to replay pending DB update; keeping for next run",
+                extra={
+                    "correlation_id": correlation_id,
+                    "error": str(e),
+                    "update_index": idx,
+                }
+            )
+            remaining.append(item)
+
+    # Rewrite file with only remaining (unflushed) updates
+    rewrite_pending_db_updates(config, remaining)
+    
+    logger.info(
+        "Pending DB updates flush complete",
+        extra={
+            "total_pending": len(pending),
+            "successfully_flushed": flushed_count,
+            "remaining": len(remaining),
+        }
+    )
 
 
 # =============================================================================
@@ -1342,13 +1556,15 @@ def run_pipeline(
     strict_validation: bool = True,
     dry_run: bool = False,
 ) -> PipelineMetrics:
-    """Run the complete extraction pipeline."""
+    """Run the complete extraction pipeline with DB-first checkpoint pattern."""
     start_time = perf_counter()
     metrics = PipelineMetrics(correlation_id=CorrelationIdFilter.generate_correlation_id())
 
     pipeline_name = "reverse_etl_events"
     run_id = None
+    db_write_failed = False
     
+    # Best-effort DB run insert
     try:
         run_id = db_insert_pipeline_run(config, pipeline_name, metrics)
     except Exception as e:
@@ -1383,18 +1599,27 @@ def run_pipeline(
         stage_id = None
         try:
             if run_id:
-                stage_id = db_stage_start(config, run_id, "EXTRACT")
+                try:
+                    stage_id = db_stage_start(config, run_id, "EXTRACT")
+                except Exception as e:
+                    logger.warning("DB stage start failed", extra={"error": str(e)})
 
             with log_operation(logger, "extract_phase"):
                 raw_events = fetch_events(config)
                 metrics.rows_fetched = len(raw_events)
 
             if run_id and stage_id:
-                db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_fetched)
+                try:
+                    db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_fetched)
+                except Exception as e:
+                    logger.warning("DB stage end failed", extra={"error": str(e)})
 
         except Exception as e:
             if run_id and stage_id:
-                db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                try:
+                    db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                except Exception as db_err:
+                    logger.warning("DB stage end failed", extra={"error": str(db_err)})
             raise
 
         # ============================================================
@@ -1403,7 +1628,10 @@ def run_pipeline(
         stage_id = None
         try:
             if run_id:
-                stage_id = db_stage_start(config, run_id, "TRANSFORM")
+                try:
+                    stage_id = db_stage_start(config, run_id, "TRANSFORM")
+                except Exception as e:
+                    logger.warning("DB stage start failed", extra={"error": str(e)})
 
             with log_operation(logger, "transform_phase"):
                 df_valid, df_rejects = transform_events(
@@ -1435,11 +1663,17 @@ def run_pipeline(
                 )
 
             if run_id and stage_id:
-                db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_output)
+                try:
+                    db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_output)
+                except Exception as e:
+                    logger.warning("DB stage end failed", extra={"error": str(e)})
 
         except Exception as e:
             if run_id and stage_id:
-                db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                try:
+                    db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                except Exception as db_err:
+                    logger.warning("DB stage end failed", extra={"error": str(db_err)})
             raise
 
         # Check if reject threshold was breached
@@ -1452,7 +1686,10 @@ def run_pipeline(
             stage_id = None
             try:
                 if run_id:
-                    stage_id = db_stage_start(config, run_id, "LOAD")
+                    try:
+                        stage_id = db_stage_start(config, run_id, "LOAD")
+                    except Exception as e:
+                        logger.warning("DB stage start failed", extra={"error": str(e)})
 
                 with log_operation(logger, "load_phase"):
                     save_result = save_events(df_valid, df_rejects, config, upload_to_cloud=upload_to_cloud)
@@ -1476,11 +1713,17 @@ def run_pipeline(
                         metrics.rejects_adls_path = save_result["rejects_adls"]["path"]
 
                 if run_id and stage_id:
-                    db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_output)
+                    try:
+                        db_stage_end(config, stage_id, "SUCCESS", row_count=metrics.rows_output)
+                    except Exception as e:
+                        logger.warning("DB stage end failed", extra={"error": str(e)})
 
             except Exception as e:
                 if run_id and stage_id:
-                    db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                    try:
+                        db_stage_end(config, stage_id, "FAILED", row_count=None, error_message=str(e))
+                    except Exception as db_err:
+                        logger.warning("DB stage end failed", extra={"error": str(db_err)})
                 raise
         else:
             logger.info("Dry run - skipping file output")
@@ -1497,14 +1740,17 @@ def run_pipeline(
             
             # Record this failure as a separate stage for visibility
             if run_id:
-                gate_stage_id = db_stage_start(config, run_id, "QUALITY_GATE")
-                db_stage_end(
-                    config,
-                    gate_stage_id,
-                    "FAILED",
-                    row_count=metrics.rows_output,
-                    error_message=f"Reject rate {metrics.reject_rate_pct:.6f}% exceeded threshold {config.reject_threshold_pct:.6f}%",
-                )
+                try:
+                    gate_stage_id = db_stage_start(config, run_id, "QUALITY_GATE")
+                    db_stage_end(
+                        config,
+                        gate_stage_id,
+                        "FAILED",
+                        row_count=metrics.rows_output,
+                        error_message=f"Reject rate {metrics.reject_rate_pct:.6f}% exceeded threshold {config.reject_threshold_pct:.6f}%",
+                    )
+                except Exception as e:
+                    logger.warning("DB quality gate stage tracking failed", extra={"error": str(e)})
             
             logger.error("Pipeline failed due to reject threshold breach", extra=metrics.to_dict())
             raise DataQualityError(
@@ -1542,12 +1788,13 @@ def run_pipeline(
         metrics.end_time = datetime.now(timezone.utc)
         metrics.duration_seconds = perf_counter() - start_time
         
-        # Finalize DB run tracking - this writes error_message to pipeline_run
+        # Best-effort: Finalize DB run tracking
         if run_id:
             try:
                 db_finalize_pipeline_run(config, run_id, metrics)
             except Exception as e:
-                logger.warning("DB run finalize failed", extra={"error": str(e), "run_id": run_id})
+                db_write_failed = True
+                logger.error("DB run finalize failed", extra={"error": str(e), "run_id": run_id})
 
     return metrics
 
@@ -1581,7 +1828,7 @@ Examples:
     parser.add_argument("--check-api", action="store_true", help="Check API health and exit")
 
     # Airflow-friendly resume
-    parser.add_argument("--use-checkpoint", action="store_true", help="Use state file to select next week to run")
+    parser.add_argument("--use-checkpoint", action="store_true", help="Use DB checkpoint to select next week to run")
     parser.add_argument("--state-path", type=str, default=None, help="Override checkpoint file path")
     parser.add_argument(
         "--advance-on-skip",
@@ -1606,28 +1853,41 @@ def main() -> int:
             config.state_dir = p.parent
             config.state_file_name = p.name
 
-        pipeline_name = "reverse_etl_events"  # keep consistent with your SQL row
+        pipeline_name = "reverse_etl_events"
 
-        # If using checkpoint, load next week from state (ONLY when week-start/week-end not provided)
+        # ============================================================
+        # 🔥 AUTO-REPLAY PENDING DB UPDATES (NEW)
+        # ============================================================
+        # Try to flush any pending DB updates from previous failed runs
+        # This happens BEFORE reading checkpoint (but after config is loaded)
+        try:
+            flush_pending_db_updates(config)
+        except Exception as e:
+            # Log but don't fail - we'll try again on next run
+            logger.warning(
+                "Failed to flush pending DB updates; will retry on next run",
+                extra={"error": str(e)}
+            )
+
+        # ============================================================
+        # 🔥 DB-FIRST CHECKPOINT PATTERN
+        # ============================================================
+        # If using checkpoint, load next week from DB (REQUIRED - no JSON fallback)
         if args.use_checkpoint and (not args.week_start) and (not args.week_end):
-            # DB-first checkpoint; JSON fallback
-            state = None
-            try:
-                state = db_get_checkpoint(config, pipeline_name)
-                if state:
-                    logger.info("Loaded DB checkpoint week", extra=state)
-            except Exception as e:
-                logger.warning("DB checkpoint read failed; falling back to JSON state", extra={"error": str(e)})
-
-            if not state:
-                state = read_state(config)
-
-            if state and state.get("next_week_start"):
-                config.week_start = date.fromisoformat(state["next_week_start"])
-                config.week_end = date.fromisoformat(state.get("next_week_end")) if state.get("next_week_end") else compute_week_end(config.week_start)
-                logger.info("Loaded checkpoint week", extra={"week_start": str(config.week_start), "week_end": str(config.week_end)})
+            checkpoint = db_get_checkpoint(config, pipeline_name)
+            
+            if checkpoint and checkpoint.get("next_week_start"):
+                config.week_start = date.fromisoformat(checkpoint["next_week_start"])
+                config.week_end = date.fromisoformat(checkpoint["next_week_end"])
+                logger.info(
+                    "Loaded checkpoint from DB",
+                    extra={"week_start": str(config.week_start), "week_end": str(config.week_end)}
+                )
             else:
-                logger.info("No checkpoint found; using config.env week range", extra={"week_start": str(config.week_start), "week_end": str(config.week_end)})
+                logger.info(
+                    "No checkpoint found in DB; using config.env week range",
+                    extra={"week_start": str(config.week_start), "week_end": str(config.week_end)}
+                )
 
         # Override from CLI (explicit week always wins)
         if args.week_start:
@@ -1649,7 +1909,10 @@ def main() -> int:
             dry_run=args.dry_run,
         )
 
-        # Advance checkpoint only when run_status is SUCCESS or SUCCESS_WITH_REJECTS (and within threshold)
+        # ============================================================
+        # POST-RUN: CHECKPOINT UPDATE (DB + JSON SYNC)
+        # ============================================================
+        # Advance checkpoint only when run_status is SUCCESS or SUCCESS_WITH_REJECTS
         if (not args.dry_run) and args.use_checkpoint:
             was_skipped = (metrics.rows_fetched == 0) and (not args.force) and check_output_exists(config)
             ok_to_advance = metrics.run_status in {RunStatus.SUCCESS.value, RunStatus.SUCCESS_WITH_REJECTS.value}
@@ -1658,7 +1921,30 @@ def main() -> int:
                 next_week_start = config.week_end + timedelta(days=1)
                 next_week_end = compute_week_end(next_week_start)
 
-                # Update DB checkpoint first (best practice)
+                checkpoint_payload = {
+                    "pipeline_name": pipeline_name,
+                    "last_successful_week_start": str(config.week_start),
+                    "last_successful_week_end": str(config.week_end),
+                    "next_week_start": str(next_week_start),
+                    "next_week_end": str(next_week_end),
+                }
+
+                run_payload = {
+                    "correlation_id": metrics.correlation_id,
+                    "run_status": metrics.run_status,
+                    "reject_rate_pct": round(metrics.reject_rate_pct, 6),
+                    "reject_threshold_pct": round(metrics.reject_threshold_pct, 6),
+                    "output_file_path": metrics.output_file_path,
+                    "rows_output": metrics.rows_output,
+                    "rows_rejected": metrics.rows_rejected,
+                    "rejects_file_path": metrics.rejects_file_path,
+                    "rejects_adls_path": metrics.rejects_adls_path,
+                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+
+                db_write_failed = False
+
+                # 🔥 BEST EFFORT: Write to DB
                 try:
                     db_update_checkpoint(
                         config,
@@ -1668,28 +1954,34 @@ def main() -> int:
                         next_start=next_week_start,
                         next_end=next_week_end,
                     )
-                    logger.info("DB checkpoint updated", extra={"pipeline_name": pipeline_name, "next_week_start": str(next_week_start), "next_week_end": str(next_week_end)})
+                    logger.info(
+                        "DB checkpoint updated",
+                        extra={
+                            "pipeline_name": pipeline_name,
+                            "next_week_start": str(next_week_start),
+                            "next_week_end": str(next_week_end)
+                        }
+                    )
                 except Exception as e:
-                    logger.warning("DB checkpoint update failed; JSON state will still be written", extra={"error": str(e)})
+                    db_write_failed = True
+                    logger.error("DB WRITE FAILED after extraction", extra={"error": str(e)})
 
-                # Still write JSON state as backup
-                new_state = {
-                    "last_successful_week_start": str(config.week_start),
-                    "last_successful_week_end": str(config.week_end),
-                    "next_week_start": str(next_week_start),
-                    "next_week_end": str(next_week_end),
-                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-                    "last_run_correlation_id": metrics.correlation_id,
-                    "last_run_status": metrics.run_status,
-                    "last_reject_rate_pct": round(metrics.reject_rate_pct, 6),
-                    "reject_threshold_pct": round(metrics.reject_threshold_pct, 6),
-                    "last_output_file_path": metrics.output_file_path,
-                    "last_rows_output": metrics.rows_output,
-                    "last_rows_rejected": metrics.rows_rejected,
-                    "last_rejects_file_path": metrics.rejects_file_path,
-                    "last_rejects_adls_path": metrics.rejects_adls_path,
+                # 🔥 ALWAYS: Sync JSON (mirror/backup)
+                json_state = {
+                    **checkpoint_payload,
+                    "last_run": run_payload,
                 }
-                write_state(config, new_state)
+                write_json_state(config, json_state)
+
+                # 🔥 IF DB WRITE FAILED: Save to pending updates file
+                if db_write_failed:
+                    append_pending_db_update(config, {
+                        "checkpoint": checkpoint_payload,
+                        "run": run_payload,
+                        "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "reason": "db_checkpoint_update_failed",
+                    })
+
             else:
                 if not ok_to_advance:
                     logger.warning(
@@ -1705,6 +1997,9 @@ def main() -> int:
 
         return 0 if metrics.success else 1
 
+    except CheckpointError as e:
+        logger.error(f"Checkpoint error: {e}")
+        return 1
     except ConfigurationError as e:
         logger.error(f"Configuration error: {e}")
         return 1
