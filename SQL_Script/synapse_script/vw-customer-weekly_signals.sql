@@ -1,6 +1,7 @@
 USE reverse_etl_poc_db;
-go CREATE
-OR ALTER VIEW dbo.vw_customer_weekly_signals AS
+GO
+
+CREATE OR ALTER VIEW dbo.vw_customer_weekly_signals AS
 SELECT
     user_id,
     batch_week_start,
@@ -18,4 +19,4 @@ GROUP BY
     user_id,
     batch_week_start,
     batch_week_end;
-go
+GO

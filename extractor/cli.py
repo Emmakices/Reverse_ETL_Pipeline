@@ -121,6 +121,18 @@ def main() -> int:
                     "Loaded checkpoint from DB",
                     extra={"week_start": str(config.week_start), "week_end": str(config.week_end)}
                 )
+
+                # Warn if checkpoint is stale (not updated in 14+ days)
+                if checkpoint.get("updated_at_utc"):
+                    updated_at = datetime.fromisoformat(checkpoint["updated_at_utc"])
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - updated_at
+                    if age > timedelta(days=14):
+                        logger.warning(
+                            "Checkpoint is stale — not updated in over 2 weeks",
+                            extra={"age_days": age.days, "updated_at_utc": checkpoint["updated_at_utc"]},
+                        )
             else:
                 logger.info(
                     "No checkpoint found in DB; using config.env week range",

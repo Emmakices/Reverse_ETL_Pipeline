@@ -101,6 +101,16 @@ def push_to_salesforce(records: list[dict], sf_config: SalesforceConfig) -> dict
             summary["sample_errors"] = errors
 
         logger.info("Salesforce sync complete", extra=summary)
+
+        # Fail if error rate exceeds 10%
+        if len(records) > 0 and error_count / len(records) > 0.10:
+            from extractor.exceptions import ExtractorError
+            raise ExtractorError(
+                f"Salesforce sync error rate too high: {error_count}/{len(records)} "
+                f"({error_count / len(records) * 100:.1f}%)",
+                details=summary,
+            )
+
         return summary
 
 

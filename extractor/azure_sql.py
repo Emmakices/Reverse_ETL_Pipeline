@@ -75,7 +75,7 @@ def db_get_checkpoint(config: ExtractorConfig, pipeline_name: str) -> dict:
             cur.execute(
                 """
                 SELECT pipeline_name, last_successful_week_start, last_successful_week_end,
-                       next_week_start, next_week_end
+                       next_week_start, next_week_end, updated_at_utc
                 FROM dbo.pipeline_checkpoint
                 WHERE pipeline_name = ?
                 """,
@@ -92,6 +92,7 @@ def db_get_checkpoint(config: ExtractorConfig, pipeline_name: str) -> dict:
                 "last_successful_week_end": row[2].isoformat() if row[2] else None,
                 "next_week_start": row[3].isoformat(),
                 "next_week_end": row[4].isoformat(),
+                "updated_at_utc": row[5].isoformat() if row[5] else None,
             }
             logger.info("Loaded checkpoint from DB", extra=checkpoint)
             return checkpoint

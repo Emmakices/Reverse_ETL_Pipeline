@@ -32,6 +32,10 @@ BEGIN
 
   CREATE INDEX IX_pipeline_run_lookup
     ON dbo.pipeline_run (pipeline_name, batch_week_start, batch_week_end);
+
+  CREATE UNIQUE INDEX UX_pipeline_run_week
+    ON dbo.pipeline_run (pipeline_name, batch_week_start, batch_week_end)
+    WHERE status IN ('SUCCESS', 'SUCCESS_WITH_REJECTS');
 END
 GO
 

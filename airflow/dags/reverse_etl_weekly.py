@@ -57,10 +57,12 @@ def on_task_failure(context):
 
 DEFAULT_ARGS = {
     "owner": "terrabog",
-    "retries": 2,
+    "retries": 3,
     "retry_delay": timedelta(minutes=5),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=30),
     "execution_timeout": timedelta(hours=1),
-    "email_on_failure": True,
+    "email_on_failure": False,
     "email_on_retry": False,
     "depends_on_past": False,
     "on_failure_callback": on_task_failure,
@@ -81,6 +83,7 @@ with DAG(
     tags=["reverse-etl", "salesforce", "weekly"],
     doc_md=__doc__,
     max_active_runs=1,
+    dagrun_timeout=timedelta(hours=4),
 ) as dag:
 
     extract = BashOperator(
@@ -116,10 +119,10 @@ with DAG(
         bash_command=f"{BASE_CMD} --stage salesforce-sync",
         env={
             "PYTHONUNBUFFERED": "1",
-            "SF_USERNAME": "{{ var.value.sf_username }}",
-            "SF_PASSWORD": "{{ var.value.sf_password }}",
-            "SF_SECURITY_TOKEN": "{{ var.value.sf_security_token }}",
-            "SF_DOMAIN": "{{ var.value.get('sf_domain', 'login') }}",
+            "SF_USERNAME": Variable.get("sf_username"),
+            "SF_PASSWORD": Variable.get("sf_password"),
+            "SF_SECURITY_TOKEN": Variable.get("sf_security_token"),
+            "SF_DOMAIN": Variable.get("sf_domain", default_var="login"),
         },
         execution_timeout=timedelta(minutes=30),
     )

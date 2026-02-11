@@ -136,7 +136,8 @@ class TestPushToSalesforce:
             assert result["success_count"] == 1
             assert result["error_count"] == 0
 
-    def test_upsert_with_errors(self, sf_env):
+    def test_upsert_with_errors_above_threshold_raises(self, sf_env):
+        """100% error rate (1/1) exceeds 10% threshold -> raises ExtractorError."""
         sf_config = SalesforceConfig()
         with patch("extractor.salesforce_sync.Salesforce") as mock_sf_cls:
             mock_sf = MagicMock()
@@ -145,8 +146,28 @@ class TestPushToSalesforce:
             type(mock_sf.bulk).__getattr__ = MagicMock(return_value=mock_bulk_obj)
             mock_sf_cls.return_value = mock_sf
 
-            result = push_to_salesforce([self._SAMPLE_RECORD], sf_config)
+            from extractor.exceptions import ExtractorError
+            with pytest.raises(ExtractorError, match="error rate too high"):
+                push_to_salesforce([self._SAMPLE_RECORD], sf_config)
+
+    def test_upsert_with_errors_below_threshold_returns(self, sf_env):
+        """1/20 = 5% error rate, below 10% threshold -> returns summary."""
+        sf_config = SalesforceConfig()
+        with patch("extractor.salesforce_sync.Salesforce") as mock_sf_cls:
+            mock_sf = MagicMock()
+            mock_bulk_obj = MagicMock()
+            # 19 successes + 1 failure = 5% error rate
+            mock_bulk_obj.upsert.return_value = (
+                [{"success": True, "id": f"a{i:03d}"} for i in range(19)]
+                + [{"success": False, "errors": ["FIELD_ERROR"]}]
+            )
+            type(mock_sf.bulk).__getattr__ = MagicMock(return_value=mock_bulk_obj)
+            mock_sf_cls.return_value = mock_sf
+
+            records = [self._SAMPLE_RECORD] * 20
+            result = push_to_salesforce(records, sf_config)
             assert result["error_count"] == 1
+            assert result["success_count"] == 19
             assert "sample_errors" in result
 
 

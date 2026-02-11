@@ -129,14 +129,16 @@ def fetch_events(
             )
 
             if isinstance(response_data, dict):
-                if "data" in response_data:
-                    page_events = response_data["data"]
-                elif "events" in response_data:
-                    page_events = response_data["events"]
-                elif "results" in response_data:
-                    page_events = response_data["results"]
+                _KNOWN_KEYS = ("data", "events", "results", "items")
+                matched_key = next((k for k in _KNOWN_KEYS if k in response_data), None)
+                if matched_key is not None:
+                    page_events = response_data[matched_key]
                 else:
-                    page_events = response_data.get("items", [])
+                    raise APIResponseError(
+                        f"API response missing expected data key. "
+                        f"Expected one of {_KNOWN_KEYS}, got keys: {list(response_data.keys())}",
+                        details={"response_keys": list(response_data.keys())},
+                    )
             elif isinstance(response_data, list):
                 page_events = response_data
             else:

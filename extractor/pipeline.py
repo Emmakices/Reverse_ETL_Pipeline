@@ -73,6 +73,30 @@ def _read_stage_meta(config: ExtractorConfig, stage_name: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def cleanup_stage_metadata(config: ExtractorConfig) -> None:
+    """Remove stage metadata files from the output directory after a successful run."""
+    output_dir = config.local_output_dir
+    if not output_dir.exists():
+        return
+    for meta_file in output_dir.glob("_stage_*.json"):
+        try:
+            meta_file.unlink()
+        except OSError:
+            pass
+    # Also clean up temporary intermediate files
+    for temp_file in output_dir.glob("_raw_events.json"):
+        try:
+            temp_file.unlink()
+        except OSError:
+            pass
+    for temp_file in output_dir.glob("_validated_*.parquet"):
+        try:
+            temp_file.unlink()
+        except OSError:
+            pass
+    logger.debug("Stage metadata cleaned up", extra={"dir": str(output_dir)})
+
+
 # ---------------------------------------------------------------------------
 # Individual stage runners (for multi-task DAG)
 # ---------------------------------------------------------------------------
@@ -233,6 +257,22 @@ def run_pipeline(
 
         if skip_if_exists and check_output_exists(config):
             logger.info("Output file already exists - skipping", extra={"path": str(config.local_output_file)})
+
+            # Re-attempt ADLS upload if local file exists but cloud upload was requested
+            if upload_to_cloud and config.adls_enabled:
+                try:
+                    from extractor.storage import upload_to_adls, upload_rejects_to_adls
+                    logger.info("Re-attempting ADLS upload for existing local file")
+                    adls_result = upload_to_adls(config.local_output_file, config)
+                    metrics.adls_uploaded = True
+                    metrics.adls_path = adls_result["path"]
+                    if config.local_rejects_output_file.exists():
+                        rejects_result = upload_rejects_to_adls(config.local_rejects_output_file, config)
+                        metrics.rejects_adls_uploaded = True
+                        metrics.rejects_adls_path = rejects_result["path"]
+                except Exception as e:
+                    logger.warning("ADLS re-upload failed on skip", extra={"error": str(e)})
+
             metrics.success = True
             metrics.run_status = RunStatus.SUCCESS.value
             metrics.output_file_path = str(config.local_output_file)
@@ -412,6 +452,12 @@ def run_pipeline(
 
         metrics.success = True
         logger.info("Pipeline completed successfully", extra=metrics.to_dict())
+
+        # Clean up temporary stage metadata files
+        try:
+            cleanup_stage_metadata(config)
+        except Exception as e:
+            logger.debug("Stage metadata cleanup failed (non-critical)", extra={"error": str(e)})
 
     except ExtractorError as e:
         metrics.success = False

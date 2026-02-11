@@ -13,3 +13,4 @@ simple-salesforce>=1.12,<2.0
 # Dev / Testing
 pytest>=7.0,<9.0
 pytest-cov>=4.0,<6.0
+responses>=0.23,<1.0

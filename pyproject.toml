@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+markers = [
+    "integration: Integration tests (full pipeline flow with fake HTTP, real file I/O)",
+]
