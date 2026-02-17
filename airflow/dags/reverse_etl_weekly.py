@@ -15,7 +15,23 @@ from airflow.operators.bash import BashOperator
 logger = logging.getLogger(__name__)
 
 PROJECT_DIR = "/opt/project"
-BASE_CMD = f"cd {PROJECT_DIR} && python -m extractor.cli --use-checkpoint --log-format json"
+
+# Azure mode: full pipeline with DB checkpoint + ADLS upload + Salesforce sync
+# Local mode:  explicit dates, local-only storage, skip Salesforce
+# Toggle via Airflow Variable "pipeline_mode" (default: "local")
+PIPELINE_MODE = Variable.get("pipeline_mode", default_var="local")
+
+if PIPELINE_MODE == "azure":
+    BASE_CMD = f"cd {PROJECT_DIR} && python -m extractor.cli --use-checkpoint --log-format json"
+else:
+    # Local mode: read week range from Airflow Variables (fallback to config.env defaults)
+    WEEK_START = Variable.get("week_start", default_var="2019-12-01")
+    WEEK_END = Variable.get("week_end", default_var="2019-12-07")
+    BASE_CMD = (
+        f"cd {PROJECT_DIR} && python -m extractor.cli"
+        f" --week-start {WEEK_START} --week-end {WEEK_END}"
+        f" --local-only --log-format json"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +130,21 @@ with DAG(
         execution_timeout=timedelta(minutes=5),
     )
 
+    _sf_user = Variable.get("sf_username", default_var="")
+    _sf_configured = bool(_sf_user)
+
     salesforce_sync = BashOperator(
         task_id="salesforce_sync",
-        bash_command=f"{BASE_CMD} --stage salesforce-sync",
+        bash_command=(
+            f"{BASE_CMD} --stage salesforce-sync"
+            if PIPELINE_MODE == "azure" and _sf_configured
+            else 'echo "Salesforce sync skipped (credentials not configured)"'
+        ),
         env={
             "PYTHONUNBUFFERED": "1",
-            "SF_USERNAME": Variable.get("sf_username"),
-            "SF_PASSWORD": Variable.get("sf_password"),
-            "SF_SECURITY_TOKEN": Variable.get("sf_security_token"),
+            "SF_USERNAME": _sf_user,
+            "SF_PASSWORD": Variable.get("sf_password", default_var=""),
+            "SF_SECURITY_TOKEN": Variable.get("sf_security_token", default_var=""),
             "SF_DOMAIN": Variable.get("sf_domain", default_var="login"),
         },
         execution_timeout=timedelta(minutes=30),

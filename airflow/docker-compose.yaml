@@ -15,7 +15,7 @@ services:
     restart: always
 
   airflow-init:
-    image: apache/airflow:2.9.3
+    build: .
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,13 +37,36 @@ services:
           --email admin@example.com || true
     restart: "no"
 
+  ecom-api:
+    image: ecom-api:1.0
+    container_name: ecom-api
+    environment:
+      SQLSERVER_HOST: host.docker.internal
+      SQLSERVER_PORT: "1433"
+      SQLSERVER_DB: ${ECOM_API_DB:-EcomRawDB}
+      SQLSERVER_USER: ${ECOM_API_DB_USER:-api_reader}
+      SQLSERVER_PASSWORD: ${ECOM_API_DB_PASSWORD}
+      SQLSERVER_DRIVER: "ODBC Driver 18 for SQL Server"
+      API_KEY: ${ECOM_API_KEY}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   airflow-webserver:
-    image: apache/airflow:2.9.3
+    build: .
     depends_on:
       postgres:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+      ecom-api:
+        condition: service_healthy
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
@@ -55,6 +78,14 @@ services:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
+      # Mount project root so tasks can run: cd /opt/project && python -m extractor.cli
+      # Uses absolute path from .env — relative '..' fails with spaces in Windows paths
+      - ${PROJECT_ROOT}:/opt/project
+      # Persist pipeline data and state across task restarts
+      - pipeline-data:/opt/project/data
+      - pipeline-state:/opt/project/state
+      # Mount local Azure CLI credentials for AAD token auth (from az login)
+      - ${USERPROFILE:-.}/.azure:/home/airflow/.azure:ro
     ports:
       - "8080:8080"
     command: webserver
@@ -67,12 +98,14 @@ services:
     restart: always
 
   airflow-scheduler:
-    image: apache/airflow:2.9.3
+    build: .
     depends_on:
       postgres:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+      ecom-api:
+        condition: service_healthy
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
@@ -82,6 +115,14 @@ services:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
+      # Mount project root so tasks can run: cd /opt/project && python -m extractor.cli
+      # Uses absolute path from .env — relative '..' fails with spaces in Windows paths
+      - ${PROJECT_ROOT}:/opt/project
+      # Persist pipeline data and state across task restarts
+      - pipeline-data:/opt/project/data
+      - pipeline-state:/opt/project/state
+      # Mount local Azure CLI credentials for AAD token auth (from az login)
+      - ${USERPROFILE:-.}/.azure:/home/airflow/.azure:ro
     command: scheduler
     healthcheck:
       test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname) || exit 1"]
@@ -93,3 +134,5 @@ services:
 
 volumes:
   postgres-db-volume:
+  pipeline-data:
+  pipeline-state:

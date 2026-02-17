@@ -14,6 +14,26 @@ from extractor.models import PipelineMetrics, RunStatus
 
 
 # ---------------------------------------------------------------------------
+# Shared fixture for _update_checkpoint tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_config(tmp_path):
+    from extractor.config import ExtractorConfig
+    return ExtractorConfig(
+        api_base_url="https://test-api.example.com",
+        api_key="test-key-123",
+        week_start=date(2024, 1, 8),
+        week_end=date(2024, 1, 14),
+        storage_account=None,
+        container=None,
+        local_data_dir=tmp_path / "data" / "raw_events",
+        local_rejects_dir=tmp_path / "data" / "raw_events_rejects",
+        state_dir=tmp_path / "state",
+    )
+
+
+# ---------------------------------------------------------------------------
 # parse_args tests
 # ---------------------------------------------------------------------------
 
@@ -135,6 +155,81 @@ class TestMainReturnCodes:
         mock_pipeline.side_effect = DataQualityError("threshold exceeded")
         assert main() == 1
 
+    @patch("extractor.cli.parse_args")
+    @patch("extractor.cli.setup_logging")
+    @patch("extractor.cli.get_config")
+    @patch("extractor.cli.flush_pending_db_updates")
+    @patch("extractor.cli.check_api_health")
+    @patch("extractor.cli.set_run_tag")
+    def test_health_check_success_returns_0(self, mock_tag, mock_health, mock_flush, mock_config, mock_log, mock_args):
+        mock_args.return_value = MagicMock(
+            log_level="INFO", log_format="json", week_start=None, week_end=None,
+            use_checkpoint=False, state_path=None, check_api=True, stage="full",
+        )
+        mock_config.return_value = MagicMock(week_start=date(2024, 1, 8), week_end=date(2024, 1, 14))
+        mock_health.return_value = True
+        assert main() == 0
+
+    @patch("extractor.cli.parse_args")
+    @patch("extractor.cli.setup_logging")
+    @patch("extractor.cli.get_config")
+    @patch("extractor.cli.flush_pending_db_updates")
+    @patch("extractor.cli.check_api_health")
+    @patch("extractor.cli.set_run_tag")
+    def test_health_check_failure_returns_1(self, mock_tag, mock_health, mock_flush, mock_config, mock_log, mock_args):
+        mock_args.return_value = MagicMock(
+            log_level="INFO", log_format="json", week_start=None, week_end=None,
+            use_checkpoint=False, state_path=None, check_api=True, stage="full",
+        )
+        mock_config.return_value = MagicMock(week_start=date(2024, 1, 8), week_end=date(2024, 1, 14))
+        mock_health.return_value = False
+        assert main() == 1
+
+    @patch("extractor.cli.parse_args")
+    @patch("extractor.cli.setup_logging")
+    @patch("extractor.cli.get_config")
+    @patch("extractor.cli.flush_pending_db_updates")
+    @patch("extractor.cli.db_get_checkpoint")
+    @patch("extractor.cli.run_pipeline")
+    @patch("extractor.cli.set_run_tag")
+    def test_checkpoint_loads_week_from_db(self, mock_tag, mock_pipeline, mock_ckpt, mock_flush, mock_config, mock_log, mock_args):
+        mock_args.return_value = MagicMock(
+            log_level="INFO", log_format="json", week_start=None, week_end=None,
+            use_checkpoint=True, state_path=None, check_api=False, stage="full",
+            force=False, local_only=False, dry_run=False,
+        )
+        cfg = MagicMock(week_start=date(2024, 1, 1), week_end=date(2024, 1, 7))
+        mock_config.return_value = cfg
+        mock_ckpt.return_value = {
+            "next_week_start": "2024-01-15",
+            "next_week_end": "2024-01-21",
+            "updated_at_utc": datetime(2024, 1, 14, 12, 0, tzinfo=timezone.utc).isoformat(),
+        }
+        metrics = PipelineMetrics()
+        metrics.success = True
+        mock_pipeline.return_value = metrics
+
+        assert main() == 0
+        assert cfg.week_start == date(2024, 1, 15)
+        assert cfg.week_end == date(2024, 1, 21)
+
+    @patch("extractor.cli.parse_args")
+    @patch("extractor.cli.setup_logging")
+    @patch("extractor.cli.get_config")
+    @patch("extractor.cli.flush_pending_db_updates")
+    @patch("extractor.cli._run_stage")
+    @patch("extractor.cli.set_run_tag")
+    def test_stage_mode_dispatches(self, mock_tag, mock_run_stage, mock_flush, mock_config, mock_log, mock_args):
+        mock_args.return_value = MagicMock(
+            log_level="INFO", log_format="json", week_start=None, week_end=None,
+            use_checkpoint=False, state_path=None, check_api=False, stage="extract",
+        )
+        mock_config.return_value = MagicMock(week_start=date(2024, 1, 8), week_end=date(2024, 1, 14))
+        mock_run_stage.return_value = 0
+
+        assert main() == 0
+        mock_run_stage.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _run_stage tests
@@ -176,6 +271,16 @@ class TestRunStage:
     def test_unexpected_error_returns_1(self, mock_extract):
         mock_extract.side_effect = RuntimeError("unexpected")
         assert _run_stage("extract", MagicMock(), self._make_args()) == 1
+
+    @patch("extractor.salesforce_sync.run_salesforce_sync")
+    def test_salesforce_sync_stage_success(self, mock_sf):
+        mock_sf.return_value = {"total_records": 5, "success_count": 5, "error_count": 0}
+        assert _run_stage("salesforce-sync", MagicMock(), self._make_args()) == 0
+
+    @patch("extractor.salesforce_sync.run_salesforce_sync")
+    def test_salesforce_sync_stage_with_errors(self, mock_sf):
+        mock_sf.return_value = {"total_records": 5, "success_count": 3, "error_count": 2}
+        assert _run_stage("salesforce-sync", MagicMock(), self._make_args()) == 1
 
 
 # ---------------------------------------------------------------------------

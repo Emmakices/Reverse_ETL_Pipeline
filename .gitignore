@@ -12,6 +12,14 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.coverage
+
+# Airflow runtime
+airflow/logs/
+airflow/airflow/
+
+# Claude Code
+.claude/
 
 # OS / editors
 .DS_Store

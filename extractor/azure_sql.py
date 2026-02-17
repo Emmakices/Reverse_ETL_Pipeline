@@ -39,8 +39,9 @@ def _get_sql_access_token_bytes() -> bytes:
 
 def get_sql_connection(config: ExtractorConfig) -> pyodbc.Connection:
     """
-    DSN-less connection to Azure SQL using AAD token auth.
-    Requires: az login (works for your current setup)
+    DSN-less connection to Azure SQL.
+    Uses SQL auth (username/password) when AZURE_SQL_USERNAME is set,
+    otherwise falls back to AAD token auth (az login / service principal).
     """
     if not config.azure_sql_server or not config.azure_sql_database:
         raise ConfigurationError(
@@ -49,9 +50,10 @@ def get_sql_connection(config: ExtractorConfig) -> pyodbc.Connection:
         )
     server = config.azure_sql_server
     database = config.azure_sql_database
+    driver = config.azure_sql_driver
 
     conn_str = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"DRIVER={{{driver}}};"
         f"SERVER={server},1433;"
         f"DATABASE={database};"
         "Encrypt=yes;"
@@ -59,6 +61,12 @@ def get_sql_connection(config: ExtractorConfig) -> pyodbc.Connection:
         "Connection Timeout=30;"
     )
 
+    # SQL auth when username/password are configured
+    if config.azure_sql_username and config.azure_sql_password:
+        conn_str += f"UID={config.azure_sql_username};PWD={config.azure_sql_password};"
+        return pyodbc.connect(conn_str)
+
+    # AAD token auth (fallback)
     token_bytes = _get_sql_access_token_bytes()
     return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_bytes})
 

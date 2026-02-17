@@ -38,6 +38,9 @@ class ExtractorConfig(BaseSettings):
     # Azure SQL (required when USE_DB_STATE=true)
     azure_sql_server: str | None = Field(default=None)
     azure_sql_database: str | None = Field(default=None)
+    azure_sql_username: str | None = Field(default=None)
+    azure_sql_password: str | None = Field(default=None)
+    azure_sql_driver: str = Field(default="ODBC Driver 18 for SQL Server")
 
     # Local storage
     local_data_dir: Path = Field(default=Path("data/raw_events"))

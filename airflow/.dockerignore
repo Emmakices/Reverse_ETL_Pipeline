@@ -1,0 +1,7 @@
+# Don't copy these into the Docker build context
+logs/
+plugins/
+airflow/
+.env
+__pycache__
+*.pyc
